@@ -1,0 +1,74 @@
+[
+  {
+    "id": 1,
+    "user_id": 5237959867,
+    "title": "StrongFit",
+    "weekday": 2,
+    "time": "16:30",
+    "created_at": "2026-09-15T00:23:59.207962+03:00",
+    "kind": "autobook",
+    "last_booked_for_date": null,
+    "notified_for_training_id": null,
+    "last_seen_can_check_in": null
+  },
+  {
+    "id": 4,
+    "user_id": 5237959867,
+    "title": "Badminton - Beginners",
+    "weekday": 6,
+    "time": "18:00",
+    "created_at": "2026-09-15T10:52:26.037453+03:00",
+    "kind": "autobook",
+    "last_booked_for_date": null,
+    "notified_for_training_id": null,
+    "last_seen_can_check_in": null
+  },
+  {
+    "id": 5,
+    "user_id": 5237959867,
+    "title": "Table tennis - Beginners",
+    "weekday": 6,
+    "time": "10:00",
+    "created_at": "2026-09-15T10:52:44.532626+03:00",
+    "kind": "autobook",
+    "last_booked_for_date": null,
+    "notified_for_training_id": null,
+    "last_seen_can_check_in": null
+  },
+  {
+    "id": 6,
+    "user_id": 5237959867,
+    "title": "StrongFit",
+    "weekday": 0,
+    "time": "16:30",
+    "created_at": "2026-09-15T10:54:42.082651+03:00",
+    "kind": "autobook",
+    "last_booked_for_date": null,
+    "notified_for_training_id": null,
+    "last_seen_can_check_in": null
+  },
+  {
+    "id": 7,
+    "user_id": 5237959867,
+    "title": "Table tennis - Beginners",
+    "weekday": 2,
+    "time": "16:30",
+    "kind": "watch",
+    "created_at": "2026-09-15T14:16:50.753980+03:00",
+    "last_booked_for_date": null,
+    "notified_for_training_id": null,
+    "last_seen_can_check_in": false
+  },
+  {
+    "id": 9,
+    "user_id": 5237959867,
+    "title": "StrongFit",
+    "weekday": 4,
+    "time": "16:30",
+    "kind": "autobook",
+    "created_at": "2026-09-15T16:45:38.610155+03:00",
+    "last_booked_for_date": null,
+    "notified_for_training_id": null,
+    "last_seen_can_check_in": null
+  }
+]
