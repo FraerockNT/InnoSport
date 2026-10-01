@@ -1,5 +1,7 @@
 """
 InnoSport Telegram Bot — записаться/отменить запись + админка + автозапись.
++ часы пользователя + уведомления о новых часах + админ-статистика автозаписей.
+Конфигурация — в config.json.
 """
 
 from __future__ import annotations
@@ -10,10 +12,10 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Dict
 
 import requests
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -28,31 +30,63 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    TelegramObject,
 )
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import (
-    ADMIN_USER_IDS,
-    ALLOWED_USER_IDS,
-    BOT_TOKEN,
-    SUPER_ADMIN_ID,
-)
 
-
-API_BASE = "https://sport.innopolis.university/api"
-SITE_ORIGIN = "https://sport.innopolis.university"
+# ---------------------------------------------------------------------------
+# Пути
+# ---------------------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
 SUBSCRIPTIONS_FILE = os.path.join(BASE_DIR, "subscriptions.json")
 USERS_FILE = os.path.join(BASE_DIR, "allowed_users.json")
 ADMINS_FILE = os.path.join(BASE_DIR, "admins.json")
 USER_NAMES_FILE = os.path.join(BASE_DIR, "user_names.json")
+HOURS_FILE = os.path.join(BASE_DIR, "hours.json")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("innosport-bot")
+
+
+# ---------------------------------------------------------------------------
+# Конфигурация из config.json
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_FILE):
+        raise RuntimeError(
+            f"Не найден {CONFIG_FILE}. Создайте его со структурой: "
+            '{"BOT_TOKEN": "...", "SUPER_ADMIN_ID": 123, '
+            '"ALLOWED_USER_IDS": [123], "ADMIN_USER_IDS": [123], '
+            '"HOURS_GOAL": 30}'
+        )
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось прочитать config.json: {e}") from e
+
+
+_CFG = load_config()
+
+BOT_TOKEN: str = str(_CFG.get("BOT_TOKEN", "")).strip()
+SUPER_ADMIN_ID: int = int(_CFG.get("SUPER_ADMIN_ID", 0))
+ALLOWED_USER_IDS: set[int] = {int(x) for x in _CFG.get("ALLOWED_USER_IDS", [])}
+ADMIN_USER_IDS: set[int] = {int(x) for x in _CFG.get("ADMIN_USER_IDS", [])}
+HOURS_GOAL: int = int(_CFG.get("HOURS_GOAL", 30))
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в config.json")
+if not SUPER_ADMIN_ID:
+    raise RuntimeError("SUPER_ADMIN_ID не задан в config.json")
+
+
+API_BASE = "https://sport.innopolis.university/api"
+SITE_ORIGIN = "https://sport.innopolis.university"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +102,10 @@ class NotLoggedInError(Exception):
 
 
 class NetworkError(Exception):
+    pass
+
+
+class HoursUnavailableError(Exception):
     pass
 
 
@@ -123,7 +161,7 @@ def format_user_label(user_id: int) -> str:
         parts.append(first)
     if uname:
         parts.append(f"@{uname}")
-    return " ".join(parts) if parts else "—"
+    return " ".join(parts) if parts else f"ID {user_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +258,54 @@ def remove_admin(user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Часы пользователей (hours.json)
+# ---------------------------------------------------------------------------
+
+HOURS_STATE: dict[int, dict] = {}
+
+
+def load_hours() -> None:
+    global HOURS_STATE
+    if not os.path.exists(HOURS_FILE):
+        HOURS_STATE = {}
+        return
+    try:
+        with open(HOURS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        HOURS_STATE = {int(k): v for k, v in raw.items()}
+    except Exception:
+        log.exception("Не удалось загрузить hours.json")
+        HOURS_STATE = {}
+
+
+def save_hours() -> None:
+    try:
+        with open(HOURS_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in HOURS_STATE.items()},
+                      f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.exception("Не удалось сохранить hours.json")
+
+
+def get_saved_hours(user_id: int) -> float | None:
+    entry = HOURS_STATE.get(user_id) or {}
+    val = entry.get("hours")
+    return float(val) if val is not None else None
+
+
+def set_saved_hours(user_id: int, hours: float) -> None:
+    entry = HOURS_STATE.get(user_id, {})
+    entry["hours"] = float(hours)
+    entry["updated_at"] = datetime.now(MSK).isoformat()
+    HOURS_STATE[user_id] = entry
+    save_hours()
+
+
+# ---------------------------------------------------------------------------
 # Per-user сессии
 # ---------------------------------------------------------------------------
 
-USER_COOKIES: dict[int, dict[str, str]] = {}
+USER_COOKIES: dict[int, dict] = {}
 _SESSION_CACHE: dict[int, requests.Session] = {}
 
 
@@ -251,12 +333,25 @@ def save_user_cookies() -> None:
 
 
 def set_user_cookies(user_id, sessionid, csrftoken) -> None:
-    USER_COOKIES[user_id] = {
-        "sessionid": sessionid,
-        "csrftoken": csrftoken,
-    }
+    entry = USER_COOKIES.get(user_id, {})
+    entry["sessionid"] = sessionid
+    entry["csrftoken"] = csrftoken
+    USER_COOKIES[user_id] = entry
     save_user_cookies()
     _SESSION_CACHE.pop(user_id, None)
+
+
+def set_user_site_id(user_id: int, site_id: int) -> None:
+    entry = USER_COOKIES.get(user_id, {})
+    entry["site_id"] = int(site_id)
+    USER_COOKIES[user_id] = entry
+    save_user_cookies()
+
+
+def get_user_site_id(user_id: int) -> int | None:
+    entry = USER_COOKIES.get(user_id) or {}
+    val = entry.get("site_id")
+    return int(val) if val is not None else None
 
 
 def clear_user_cookies(user_id: int) -> None:
@@ -333,12 +428,34 @@ def _request(method, path, user_id, **kw) -> requests.Response:
     assert resp is not None
     if resp.status_code in (401, 403):
         raise SessionExpiredError(f"{method} {path} -> {resp.status_code}")
+
+    ctype = resp.headers.get("Content-Type", "").lower()
+    if "application/json" not in ctype:
+        raise SessionExpiredError(
+            f"{method} {path} -> non-JSON response ({ctype})"
+        )
+
     return resp
+
+
+def _request_html(path: str, user_id: int) -> str:
+    """GET страницы сайта (HTML), а не API. Для парсинга student_id."""
+    creds = USER_COOKIES.get(user_id)
+    if not creds:
+        raise NotLoggedInError(str(user_id))
+    session = get_session(user_id)
+    try:
+        resp = session.get(f"{SITE_ORIGIN}{path}", timeout=20)
+    except (requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError) as e:
+        raise NetworkError(str(e)) from e
+    if resp.status_code in (401, 403):
+        raise SessionExpiredError(f"GET {path} -> {resp.status_code}")
+    return resp.text
 
 
 def api_get_me(user_id: int) -> dict:
     r = _request("GET", "/profile/student", user_id)
-    r.raise_for_status()
     return r.json()
 
 
@@ -348,7 +465,6 @@ def api_get_trainings_range(user_id, start, end) -> list[dict]:
                      "start": start.astimezone(timezone.utc).isoformat(),
                      "end": end.astimezone(timezone.utc).isoformat(),
                  })
-    r.raise_for_status()
     return r.json()
 
 
@@ -359,7 +475,6 @@ def api_get_trainings(user_id, day: datetime) -> list[dict]:
 
 def api_get_training(user_id, training_id) -> dict:
     r = _request("GET", f"/training/{training_id}", user_id)
-    r.raise_for_status()
     return r.json()
 
 
@@ -371,6 +486,42 @@ def api_check_in(user_id, training_id) -> None:
 def api_cancel_check_in(user_id, training_id) -> None:
     r = _request("POST", f"/training/{training_id}/cancel_check_in", user_id)
     r.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# student_id / часы
+# ---------------------------------------------------------------------------
+
+_STUDENT_ID_RE = re.compile(r'const\s+student_id\s*=\s*"(\d+)"')
+
+
+def fetch_student_id_from_profile(user_id: int) -> int:
+    """Парсит const student_id = "10852"; из HTML страницы /profile/."""
+    html = _request_html("/profile/", user_id)
+    m = _STUDENT_ID_RE.search(html)
+    if not m:
+        raise HoursUnavailableError("student_id не найден в HTML профиля")
+    return int(m.group(1))
+
+
+def api_get_hours(user_id: int) -> float:
+    site_id = get_user_site_id(user_id)
+    if site_id is None:
+        site_id = fetch_student_id_from_profile(user_id)
+        set_user_site_id(user_id, site_id)
+
+    r = _request("GET", f"/attendance/{site_id}/negative_hours", user_id)
+    data = r.json()
+    val = data.get("final_hours")
+    if val is None:
+        raise HoursUnavailableError("final_hours отсутствует в ответе API")
+    return float(val)
+
+
+def fmt_hours(h: float) -> str:
+    if abs(h - round(h)) < 0.01:
+        return str(int(round(h)))
+    return f"{h:.1f}"
 
 
 MSK = timezone(timedelta(hours=3))
@@ -526,6 +677,7 @@ def main_menu(user_id: int | None = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🗓 Выбрать день"),
          KeyboardButton(text="📋 Мои записи")],
         [KeyboardButton(text="💪 Выбрать спорт")],
+        [KeyboardButton(text="🕐 Мои часы")],
         [KeyboardButton(text="⏰ Автозапись"),
          KeyboardButton(text="👀 Отслеживать освободившиеся места")],
         [KeyboardButton(text="📌 Мои автозаписи")],
@@ -539,7 +691,13 @@ def main_menu(user_id: int | None = None) -> ReplyKeyboardMarkup:
     )
 
 
-EXPIRED_MSG = "⚠️ Сессия истекла.\nОтправь /login и авторизуйся заново."
+EXPIRED_MSG = (
+    "⚠️ Куки (sessionid/csrftoken) больше не работают.\n"
+    "Такое бывает, если вы вышли с сайта, сменили пароль "
+    "или сессия истекла от бездействия.\n\n"
+    "Отправь /login и вставь свежие sessionid и csrftoken — "
+    "подписки сохранятся."
+)
 ACCESS_DENIED_MSG = "⛔ У вас нет доступа к этому боту."
 NOT_LOGGED_IN_MSG = ("🔑 Сначала нужно авторизоваться.\n"
                      "Отправь /login и следуй инструкции.")
@@ -547,6 +705,10 @@ NETWORK_ERROR_MSG = ("🌐 Не получилось достучаться до
                      "sport.innopolis.university — проблема с сетью.\n"
                      "Попробуй ещё раз через несколько секунд, "
                      "либо на время отключи VPN.")
+HOURS_UNAVAILABLE_MSG = (
+    "🕐 Не удалось получить данные о часах.\n"
+    "Возможно, сайт пока не отдаёт их через API."
+)
 
 
 def handle_api_errors(func):
@@ -575,6 +737,12 @@ def handle_api_errors(func):
                 await msg.answer(NETWORK_ERROR_MSG, show_alert=True)
             else:
                 await msg.answer(NETWORK_ERROR_MSG)
+        except HoursUnavailableError:
+            msg = args[0]
+            if isinstance(msg, CallbackQuery):
+                await msg.answer(HOURS_UNAVAILABLE_MSG, show_alert=True)
+            else:
+                await msg.answer(HOURS_UNAVAILABLE_MSG)
         except requests.RequestException as e:
             msg = args[0]
             text = f"😵 Ошибка запроса: <code>{e}</code>"
@@ -649,10 +817,25 @@ async def cmd_login(message: Message, state: FSMContext):
     await message.answer(LOGIN_INSTRUCTIONS)
 
 
-@dp.message(Command("cancel"), LoginStates.waiting_for_cookies)
+@dp.message(Command("cancel"), LoginStates)
 async def cmd_cancel_login(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Ок, отменил авторизацию.")
+    await message.answer("Ок, отменил.")
+
+
+@dp.message(Command("setid"))
+async def cmd_setid(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().isdigit():
+        await message.answer(
+            "Использование: <code>/setid 10852</code>\n"
+            "ID можно найти в исходнике страницы профиля: "
+            "<code>const student_id = \"...\"</code>"
+        )
+        return
+    site_id = int(parts[1].strip())
+    set_user_site_id(message.from_user.id, site_id)
+    await message.answer(f"✅ Сохранил site_id = <code>{site_id}</code>.")
 
 
 @dp.message(Command("logout"))
@@ -704,9 +887,30 @@ async def process_login_cookies(message: Message, state: FSMContext):
         )
         return
 
+    hours_line = ""
+    site_line = ""
+    try:
+        sid = await asyncio.to_thread(
+            fetch_student_id_from_profile, message.from_user.id
+        )
+        set_user_site_id(message.from_user.id, sid)
+        site_line = f"\nsite_id: <code>{sid}</code>"
+    except Exception:
+        site_line = ("\n⚠️ Не удалось автоматически определить site_id. "
+                     "Позже пришли <code>/setid &lt;число&gt;</code>, "
+                     "если часы не будут работать.")
+
+    try:
+        hours = await asyncio.to_thread(api_get_hours, message.from_user.id)
+        set_saved_hours(message.from_user.id, hours)
+        hours_line = (f"\n🕐 Твои часы: <b>{fmt_hours(hours)}</b> / "
+                      f"{HOURS_GOAL}")
+    except Exception:
+        pass
+
     await message.answer(
         f"✅ Готово, {me['name']}! Я запомнил твою сессию — "
-        "логиниться заново не нужно.",
+        f"логиниться заново не нужно.{site_line}{hours_line}",
         reply_markup=main_menu(message.from_user.id),
     )
 
@@ -937,6 +1141,25 @@ async def btn_pick_sport(message: Message):
     await start_sport_choice(message)
 
 
+@dp.message(F.text == "🕐 Мои часы")
+@handle_api_errors
+async def btn_my_hours(message: Message):
+    hours = await asyncio.to_thread(api_get_hours, message.from_user.id)
+    set_saved_hours(message.from_user.id, hours)
+    pct = min(100, int(round(hours / HOURS_GOAL * 100))) if HOURS_GOAL else 0
+    bar_len = 20
+    filled = int(round(bar_len * pct / 100))
+    bar = "█" * filled + "░" * (bar_len - filled)
+    text = (
+        f"🕐 <b>Мои часы</b>\n\n"
+        f"Набрано: <b>{fmt_hours(hours)}</b> из {HOURS_GOAL}\n"
+        f"<code>{bar}</code> {pct}%\n"
+    )
+    if hours >= HOURS_GOAL:
+        text += "\n🏆 Норма выполнена!"
+    await message.answer(text)
+
+
 @dp.message(Command("today"))
 @handle_api_errors
 async def cmd_today(message: Message):
@@ -959,6 +1182,12 @@ async def cmd_my(message: Message):
 @handle_api_errors
 async def cmd_sports(message: Message):
     await start_sport_choice(message)
+
+
+@dp.message(Command("hours"))
+@handle_api_errors
+async def cmd_hours(message: Message):
+    await btn_my_hours(message)
 
 
 @dp.message(Command("menu"))
@@ -1427,6 +1656,8 @@ def admin_menu(user_id: int) -> InlineKeyboardMarkup:
                               callback_data="admin:remove")],
         [InlineKeyboardButton(text="📋 Список участников",
                               callback_data="admin:list")],
+        [InlineKeyboardButton(text="📊 Автозаписи пользователей",
+                              callback_data="admin:subs")],
         [InlineKeyboardButton(text="📢 Сделать объявление",
                               callback_data="admin:broadcast")],
     ]
@@ -1455,9 +1686,56 @@ async def btn_admin(message: Message, state: FSMContext):
     await message.answer(
         "👑 <b>Админ-панель</b>\n\n"
         f"Участников в белом списке: <b>{len(ALLOWED_USER_IDS)}</b>\n"
-        f"Админов (кроме главного): <b>{len(ADMIN_USER_IDS)}</b>",
+        f"Админов (кроме главного): <b>{len(ADMIN_USER_IDS)}</b>\n"
+        f"Подписок в системе: <b>{len(SUBSCRIPTIONS)}</b>",
         reply_markup=admin_menu(message.from_user.id),
     )
+
+
+@dp.callback_query(F.data == "admin:subs")
+async def cb_admin_subs(query: CallbackQuery):
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Только для админа.", show_alert=True)
+        return
+    await send_admin_subs(query)
+    await query.answer()
+
+
+async def send_admin_subs(query: CallbackQuery):
+    if not SUBSCRIPTIONS:
+        await query.message.answer("📊 Пока нет ни одной автозаписи.")
+        return
+
+    groups: dict[tuple, list[dict]] = {}
+    for s in SUBSCRIPTIONS:
+        key = (s["title"], s["weekday"], s["time"])
+        groups.setdefault(key, []).append(s)
+
+    lines = ["📊 <b>Автозаписи пользователей</b>", ""]
+    for (title, weekday, time_str), subs in sorted(
+        groups.items(), key=lambda kv: (kv[0][1], kv[0][2], kv[0][0])
+    ):
+        lines.append(
+            f"<b>{title}</b> — {WEEKDAY_NAMES[weekday]}, {time_str}"
+        )
+        for s in subs:
+            icon = "⏰" if s.get("kind") == "autobook" else "👀"
+            label = format_user_label(s["user_id"])
+            lines.append(f"  {icon} {label}")
+        lines.append("")
+
+    text = "\n".join(lines).rstrip()
+    if len(text) <= 4000:
+        await query.message.answer(text)
+        return
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 4000:
+            await query.message.answer(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await query.message.answer(chunk)
 
 
 @dp.callback_query(F.data == "admin:add")
@@ -1789,8 +2067,10 @@ async def _notify_session_expired(user_id: int) -> None:
     try:
         await BOT_INSTANCE.send_message(
             user_id,
-            "⚠️ Сессия истекла. Автозапись/наблюдение приостановлены.\n"
-            "Отправь /login, чтобы войти заново — подписки сохранятся.",
+            "⚠️ Куки (sessionid/csrftoken) больше не работают.\n"
+            "Автозапись и наблюдение приостановлены.\n\n"
+            "Отправь /login и вставь свежие sessionid и csrftoken — "
+            "подписки сохранятся.",
         )
     except Exception:
         log.exception("Не удалось уведомить пользователя %s", user_id)
@@ -1986,6 +2266,65 @@ async def watch_poller() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Поллер часов
+# ---------------------------------------------------------------------------
+
+HOURS_POLL_INTERVAL = 15 * 60
+
+
+async def hours_poller() -> None:
+    while True:
+        try:
+            for user_id in list(USER_COOKIES.keys()):
+                try:
+                    hours = await asyncio.to_thread(api_get_hours, user_id)
+                except (SessionExpiredError, NotLoggedInError):
+                    await _notify_session_expired(user_id)
+                    continue
+                except (NetworkError, requests.RequestException,
+                        HoursUnavailableError):
+                    continue
+                except Exception:
+                    log.exception("hours_poller: ошибка для user_id=%s",
+                                  user_id)
+                    continue
+
+                prev = get_saved_hours(user_id)
+                if prev is None:
+                    set_saved_hours(user_id, hours)
+                    continue
+
+                if abs(prev - hours) < 0.01:
+                    continue
+
+                set_saved_hours(user_id, hours)
+                if BOT_INSTANCE is not None:
+                    try:
+                        delta = hours - prev
+                        sign = "+" if delta > 0 else ""
+                        text = (
+                            "🕐 <b>Обновление часов</b>\n\n"
+                            f"Было: {fmt_hours(prev)}\n"
+                            f"Стало: <b>{fmt_hours(hours)}</b> "
+                            f"({sign}{fmt_hours(delta)})\n"
+                            f"Норма: {HOURS_GOAL}"
+                        )
+                        if hours >= HOURS_GOAL and prev < HOURS_GOAL:
+                            text += "\n\n🏆 Поздравляю, норма выполнена!"
+                        await BOT_INSTANCE.send_message(user_id, text)
+                    except Exception:
+                        log.exception(
+                            "Не удалось уведомить о часах user_id=%s",
+                            user_id,
+                        )
+
+        except Exception:
+            log.exception("hours_poller упал с ошибкой")
+
+        await asyncio.sleep(HOURS_POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # Startup / main
 # ---------------------------------------------------------------------------
 
@@ -1998,15 +2337,18 @@ async def on_startup(bot: Bot) -> None:
     load_user_cookies()
     load_user_names()
     load_subscriptions()
+    load_hours()
 
     asyncio.create_task(autobook_scheduler())
     asyncio.create_task(watch_poller())
+    asyncio.create_task(hours_poller())
 
     log.info(
         "Bot started. Сессий: %d, подписок: %d, белый список: %d, "
-        "админов: %d (+главный), имён: %d",
+        "админов: %d (+главный), имён: %d, часов сохранено: %d",
         len(USER_COOKIES), len(SUBSCRIPTIONS),
         len(ALLOWED_USER_IDS), len(ADMIN_USER_IDS), len(USER_NAMES),
+        len(HOURS_STATE),
     )
 
 
