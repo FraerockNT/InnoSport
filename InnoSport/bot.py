@@ -2448,6 +2448,14 @@ dp.startup.register(on_startup)
 def main():
     from aiogram.client.default import DefaultBotProperties
 
+    # --- проверка связи с Telegram ---
+    try:
+        r = requests.get("https://api.telegram.org", timeout=10)
+        print("TELEGRAM OK", r.status_code, flush=True)
+    except Exception as e:
+        print("TELEGRAM FAIL", e, flush=True)
+    # --- конец проверки ---
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),
