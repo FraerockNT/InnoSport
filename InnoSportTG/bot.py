@@ -1,9 +1,3 @@
-"""
-InnoSport Telegram Bot — записаться/отменить запись + админка + автозапись.
-+ часы пользователя + уведомления о новых часах + админ-статистика автозаписей.
-Конфигурация — в config.json.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -362,20 +356,31 @@ def clear_user_cookies(user_id: int) -> None:
 
 def _build_session() -> requests.Session:
     s = requests.Session()
+
     retry = Retry(
-        total=3, connect=3, read=2, backoff_factor=1.5,
+        total=3,
+        connect=3,
+        read=2,
+        backoff_factor=1.5,
         status_forcelist=(500, 502, 503, 504),
         allowed_methods=("GET", "POST", "PUT", "PATCH", "DELETE"),
         raise_on_status=False,
     )
+
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
+
     s.headers.update({
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
         "Accept": "application/json, */*",
         "Referer": f"{SITE_ORIGIN}/profile/",
     })
+
     return s
 
 
@@ -406,54 +411,139 @@ def _request(method, path, user_id, **kw) -> requests.Response:
     last_exc = None
     resp = None
 
+    url = f"{API_BASE}{path}"
+
     for attempt in range(2):
         session = get_session(user_id)
+
         try:
-            resp = session.request(
-                method, f"{API_BASE}{path}",
-                headers=headers, timeout=20, **kw,
+            log.info(
+                "Отправляю запрос: method=%s url=%s attempt=%d/2",
+                method, url, attempt + 1
             )
+
+            resp = session.request(
+                method,
+                url,
+                headers=headers,
+                timeout=(10, 30),
+                **kw,
+            )
+
+            log.info(
+                "Ответ сайта: method=%s url=%s status=%s content_type=%s",
+                method,
+                resp.url,
+                resp.status_code,
+                resp.headers.get("Content-Type"),
+            )
+
+            if resp.status_code >= 400:
+                log.warning(
+                    "Ошибка HTTP: status=%s body=%s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+
             break
-        except (requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError) as e:
+
+        except requests.exceptions.RequestException as e:
             last_exc = e
-            log.warning("Сетевая ошибка (%s) при %s %s, попытка %d/2",
-                        e.__class__.__name__, method, path, attempt + 1)
+
+            log.exception(
+                "Ошибка соединения: method=%s url=%s attempt=%d/2",
+                method, url, attempt + 1
+            )
+
             _SESSION_CACHE.pop(user_id, None)
+
             if attempt == 0:
                 time.sleep(1.5)
+
     else:
         raise NetworkError(str(last_exc)) from last_exc
 
     assert resp is not None
+
     if resp.status_code in (401, 403):
-        raise SessionExpiredError(f"{method} {path} -> {resp.status_code}")
+        raise SessionExpiredError(
+            f"{method} {path} -> {resp.status_code}"
+        )
+
+    if not resp.ok:
+        resp.raise_for_status()
 
     ctype = resp.headers.get("Content-Type", "").lower()
+
     if "application/json" not in ctype:
-        raise SessionExpiredError(
-            f"{method} {path} -> non-JSON response ({ctype})"
+        raise RuntimeError(
+            f"{method} {path}: ожидался JSON, "
+            f"получен Content-Type={ctype}, "
+            f"status={resp.status_code}"
         )
 
     return resp
 
-
 def _request_html(path: str, user_id: int) -> str:
     """GET страницы сайта (HTML), а не API. Для парсинга student_id."""
+
     creds = USER_COOKIES.get(user_id)
     if not creds:
         raise NotLoggedInError(str(user_id))
-    session = get_session(user_id)
-    try:
-        resp = session.get(f"{SITE_ORIGIN}{path}", timeout=20)
-    except (requests.exceptions.SSLError,
-            requests.exceptions.ConnectionError) as e:
-        raise NetworkError(str(e)) from e
-    if resp.status_code in (401, 403):
-        raise SessionExpiredError(f"GET {path} -> {resp.status_code}")
-    return resp.text
 
+    url = f"{SITE_ORIGIN}{path}"
+    last_exc = None
 
+    for attempt in range(2):
+        session = get_session(user_id)
+
+        try:
+            log.info(
+                "Запрашиваю HTML: url=%s attempt=%d/2",
+                url, attempt + 1
+            )
+
+            resp = session.get(url, timeout=(10, 30))
+
+            log.info(
+                "Ответ HTML: url=%s status=%s content_type=%s",
+                resp.url,
+                resp.status_code,
+                resp.headers.get("Content-Type"),
+            )
+
+            if resp.status_code >= 400:
+                log.warning(
+                    "Ошибка HTML: status=%s body=%s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+
+            if resp.status_code in (401, 403):
+                raise SessionExpiredError(
+                    f"GET {path} -> {resp.status_code}"
+                )
+
+            resp.raise_for_status()
+            return resp.text
+
+        except SessionExpiredError:
+            raise
+
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+
+            log.exception(
+                "Ошибка получения HTML: url=%s attempt=%d/2",
+                url, attempt + 1
+            )
+
+            _SESSION_CACHE.pop(user_id, None)
+
+            if attempt == 0:
+                time.sleep(1.5)
+
+    raise NetworkError(str(last_exc)) from last_exc
 def api_get_me(user_id: int) -> dict:
     r = _request("GET", "/profile/student", user_id)
     return r.json()
